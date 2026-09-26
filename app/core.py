@@ -114,6 +114,18 @@
         k_max = floor((C - diff) / M)
     k_max < k_min 即单段无解。各段均可行后，账单总用量联立直接复用
     reconcile_total 的整数区间收紧（同余冲突 / 总量超界原因也一致）。
+
+异常采样清理（clean_readings）：
+    任意两条读数 (v_i, t_i)、(v_j, t_j)（i < j）可相邻保留，当且仅当
+    把它们视为一段相邻读数时物理可行（solve_segment 同一判定：存在
+    k >= 0 使 diff + k*M 非负且不超速率上限）。保留序列首尾必须为索引
+    0 与 n-1，删除最少 ⟺ 保留最多 ⟺ 有向无环图（边只从低索引指向高
+    索引）上 0 -> n-1 的最长路径，按拓扑序一遍 DP 求首到各点最多边数
+    dist、逆序一遍求各点到末点最多边数 tail；D = dist[n-1]，不可达即
+    无解。最优路径不唯一时按保留索引序列字典序选定：从首读数出发，每
+    步取满足 dist[q] = dist[cur]+1 且 dist[q]+tail[q] = D 的最小后继
+    q（最长路上的点必有这样的最优后继），归纳得到字典序最小的完整序
+    列。逐对判定与 DP 均为 O(n²)，不枚举保留子序列。
 """
 
 from __future__ import annotations
@@ -1389,4 +1401,118 @@ def compare_dual_meter(
         b_usage_max=b_usage_max,
         intersect_min=intersect_min,
         intersect_max=intersect_max,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 异常采样清理（clean-readings）：删除最少内部读数使保留序列物理可行
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CleanReadingsResult:
+    """异常采样清理结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_NO_SOLUTION
+    # 保留读数索引（升序，含首索引 0 与末索引 n-1）；无解时为空
+    kept_indices: Tuple[int, ...]
+    # 删除的内部读数索引（升序）；无解时为空
+    removed_indices: Tuple[int, ...]
+
+
+def clean_readings(
+    values: Sequence[int],
+    timestamps: Sequence[datetime],
+    modulus: int,
+    max_rate_per_second: Fraction,
+) -> CleanReadingsResult:
+    """删除最少内部读数，使保留序列（首尾必须保留）两两相邻物理可行。
+
+    任意两条读数 ``(v_i, t_i)``、``(v_j, t_j)``（``i < j``）可相邻保留，
+    当且仅当把它们视为一段相邻读数时物理可行：存在非负整数回绕次数
+    ``k``，使增量 ``(v_j - v_i) + k*M`` 非负且不超过
+    ``max_rate_per_second × (t_j − t_i)`` 秒——与 :func:`solve_segment`
+    完全相同的判定（复用同一 Fraction 精确速率运算）。
+
+    读数索引构成有向无环图（边只从低索引指向高索引），保留序列即一条
+    ``0 → n-1`` 路径；删除最少 ⟺ 保留最多 ⟺ 路径边数最多，故求 DAG 上的
+    **最长路径**（按拓扑序一遍 DP 即可，不枚举子序列）。最优路径不唯一
+    时按保留索引序列字典序选定：设 ``dist[i]`` 为首读数到 ``i`` 的最多边
+    数、``tail[i]`` 为 ``i`` 到末读数的最多边数、``D = dist[n-1]``，从首读
+    数出发每步在「边可行、``dist[q] = dist[cur] + 1`` 且
+    ``dist[q] + tail[q] = D``」的候选中取最小索引。当前位置在某条最优路
+    径上时这样的后继必存在（最长路径必有最优后继），归纳即得字典序最小
+    的完整保留序列。首末不可连通（``0 → n-1`` 无路径）时返回无解。逐对
+    判定与两遍 DP 均为 ``O(n²)``，与可行回绕次数区间大小无关。
+    """
+    n = len(values)
+    if n != len(timestamps):
+        raise ValueError("values 与 timestamps 数量必须一致")
+    if n < 2:
+        raise ValueError("至少需要 2 条读数")
+
+    # 1) 逐对判定物理可行性（复用 solve_segment 的精确速率运算）：
+    #    nxt[i] 为可直接跟在 i 之后的索引列表（按 j 升序构造）
+    nxt: list = [[] for _ in range(n)]
+    for i in range(n - 1):
+        vi, ti = values[i], timestamps[i]
+        for j in range(i + 1, n):
+            elapsed = int((timestamps[j] - ti).total_seconds())
+            sol = solve_segment(
+                0, vi, values[j], elapsed, modulus, max_rate_per_second
+            )
+            if sol.status != STATUS_NO_SOLUTION:
+                nxt[i].append(j)
+
+    # 2) DAG 最长路：dist[i] 为 0 -> i 的最多边数（不可达为 None）
+    dist: list = [None] * n
+    dist[0] = 0
+    for i in range(n):
+        if dist[i] is None:
+            continue
+        for j in nxt[i]:
+            if dist[j] is None or dist[i] + 1 > dist[j]:
+                dist[j] = dist[i] + 1
+
+    # 3) tail[i] 为 i -> n-1 的最多边数（不可达为 None）
+    tail: list = [None] * n
+    tail[n - 1] = 0
+    for i in range(n - 2, -1, -1):
+        best = None
+        for j in nxt[i]:
+            if tail[j] is not None and (best is None or tail[j] + 1 > best):
+                best = tail[j] + 1
+        tail[i] = best
+
+    # 4) 首末无法连通：明确无解（首尾仍必须保留，但没有任何合法保留序列）
+    if dist[n - 1] is None:
+        return CleanReadingsResult(
+            status=STATUS_NO_SOLUTION, kept_indices=(), removed_indices=()
+        )
+
+    # 5) 字典序最小的最优保留序列：nxt[cur] 已升序，首个满足最优性条件的
+    #    候选即该位置可取的最小索引
+    total = dist[n - 1]
+    kept = [0]
+    cur = 0
+    while cur != n - 1:
+        step = dist[cur] + 1
+        for q in nxt[cur]:
+            if (
+                dist[q] == step
+                and tail[q] is not None
+                and dist[q] + tail[q] == total
+            ):
+                kept.append(q)
+                cur = q
+                break
+        else:  # 数学上不可达：最长路上的点必有最优后继
+            raise RuntimeError("最优保留序列重构失败")
+
+    kept_set = set(kept)
+    removed = tuple(i for i in range(1, n - 1) if i not in kept_set)
+    return CleanReadingsResult(
+        status=STATUS_OK,
+        kept_indices=tuple(kept),
+        removed_indices=removed,
     )

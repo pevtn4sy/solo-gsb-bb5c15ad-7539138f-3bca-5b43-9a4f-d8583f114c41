@@ -23,6 +23,7 @@ from app.core import (
     STATUS_NO_SOLUTION,
     STATUS_OK,
     charge_amount_extremes,
+    clean_readings,
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
@@ -37,7 +38,7 @@ from app.core import (
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -63,7 +64,12 @@ app = FastAPI(
         "合并重叠或相接时段，各相邻读数段扣除停水后把剩余连续供水片段"
         "分别 floor(速率×秒数) 取整求和作为段容量（不跨停水合并取整），"
         "再以账单总用量联立收紧各段可行圈数，区分单段无解、账单同余"
-        "冲突与总量超界。"
+        "冲突与总量超界；"
+        "另支持异常采样清理：任意两条读数可否相邻保留按时间差、非负"
+        "增量与回绕模数判定（复用同一精确速率运算），在首尾读数必须"
+        "保留的前提下求删除最少内部读数的完整序列（DAG 最长路径，"
+        "O(n²)，不枚举保留子序列），多组最优解按保留索引序列字典序"
+        "选定，首尾无法连通时返回明确无解状态。"
     ),
 )
 
@@ -190,6 +196,14 @@ class MinimumRateRequest(_BaseReadingsRequest):
     total_usage: int = Field(
         ge=0, description="账单总用量（非负整数）"
     )
+
+
+class CleanReadingsRequest(_BaseUsageRequest):
+    """异常采样清理请求：模数、按时序的读数序列与非负每秒速率上限。
+
+    读数、时间戳、模数与速率的校验与 `/v1/usage/verify` 完全一致
+    （复用同一校验）；首尾读数必须保留，接口只删除内部读数。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +904,29 @@ class MinimumRateResponse(BaseModel):
     )
     conflicts: List[MinimumRateTotalErrorOut] = Field(
         description="冲突明细：账单总量与模数不相容，或低于可行最小总量"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 异常采样清理接口响应模型
+# ---------------------------------------------------------------------------
+
+
+class CleanReadingsResponse(BaseModel):
+    status: Literal["ok", "no_solution"]
+    modulus: int
+    reading_count: int = Field(description="输入读数总条数")
+    kept_indices: List[int] = Field(
+        description="保留读数索引（按时间升序，必含首索引 0 与末索引）；无解时为空"
+    )
+    removed_indices: List[int] = Field(
+        description="删除的内部读数索引（升序）；无解时为空"
+    )
+    removed_count: Optional[int] = Field(
+        default=None, description="删除的内部读数条数；无解时为 null"
+    )
+    detail: Optional[str] = Field(
+        default=None, description="首尾无法连通的无解说明；有解时为 null"
     )
 
 
@@ -2191,4 +2228,58 @@ def compare_dual_meter_usage(req: DualMeterCompareRequest) -> DualMeterCompareRe
         unique=result.unique,
         meters=meters,
         conflicts=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 异常采样清理
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/usage/clean-readings", response_model=CleanReadingsResponse)
+def clean_abnormal_readings(req: CleanReadingsRequest) -> CleanReadingsResponse:
+    """异常采样清理：删除最少内部读数，使保留序列两两相邻物理可行。
+
+    复用现有秒级时间戳、读数范围、模数与非负速率上限校验（与
+    `/v1/usage/verify` 完全一致）。任意两条读数可否相邻保留的判定与
+    逐段复核相同：按时间差、非负增量与回绕模数，存在非负整数回绕
+    次数使真实增量非负且不超过「速率 × 时间差」（Fraction 精确运算，
+    无浮点误差）。首尾读数必须保留；在此前提下求删除最少内部读数的
+    完整序列（有向无环图最长路径，O(n²)，不枚举保留子序列）。多组
+    最优解按保留索引序列字典序选定，返回保留索引、删除索引与删除
+    数；首末读数在该速率与模数约束下无法连通时返回明确的
+    `no_solution` 状态及说明。
+    """
+    result = clean_readings(
+        [r.value for r in req.readings],
+        [r.timestamp for r in req.readings],
+        req.modulus,
+        Fraction(req.max_rate_per_second),
+    )
+
+    if result.status == STATUS_NO_SOLUTION:
+        last = len(req.readings) - 1
+        return CleanReadingsResponse(
+            status=STATUS_NO_SOLUTION,
+            modulus=req.modulus,
+            reading_count=len(req.readings),
+            kept_indices=[],
+            removed_indices=[],
+            removed_count=None,
+            detail=(
+                f"无解：在每秒速率上限与模数 {req.modulus} 的回绕约束下，"
+                f"首读数（索引 0）与末读数（索引 {last}）之间不存在任何"
+                f"两两相邻物理可行的保留序列（首尾必须保留），删除任意"
+                f"内部读数组合都无法连通首尾"
+            ),
+        )
+
+    return CleanReadingsResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        reading_count=len(req.readings),
+        kept_indices=list(result.kept_indices),
+        removed_indices=list(result.removed_indices),
+        removed_count=len(result.removed_indices),
+        detail=None,
     )

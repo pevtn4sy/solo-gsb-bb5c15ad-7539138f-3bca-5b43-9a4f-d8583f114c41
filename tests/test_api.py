@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.core import (
     charge_amount_extremes,
+    clean_readings,
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
@@ -20,6 +21,7 @@ from app.core import (
     solve_minimum_rate,
     solve_missing_reading,
     solve_outage_segment,
+    solve_segment,
 )
 from app.main import app
 
@@ -2921,3 +2923,271 @@ def test_format_decimal_string():
     assert format_decimal_string(0, 2) == "0.00"
     assert format_decimal_string(10250, 2) == "102.50"
     assert format_decimal_string(1, 3) == "0.001"
+
+
+# ---------------------------------------------------------------------------
+# 异常采样清理（clean-readings）
+# ---------------------------------------------------------------------------
+
+
+def _clean(payload):
+    return _post(payload, path="/v1/usage/clean-readings")
+
+
+def _clean_payload(values, offsets=None, modulus=1000, rate=10):
+    """构造 clean-readings 请求：values 为按时间排列的读数，offsets 为各自秒偏移。"""
+    base = datetime(2026, 9, 24, tzinfo=timezone.utc)
+    if offsets is None:
+        offsets = [10 * i for i in range(len(values))]
+    return {
+        "modulus": modulus,
+        "max_rate_per_second": rate,
+        "readings": [
+            {
+                "timestamp": (
+                    base + timedelta(seconds=int(s))
+                ).isoformat().replace("+00:00", "Z"),
+                "value": int(v),
+            }
+            for s, v in zip(offsets, values)
+        ],
+    }
+
+
+def test_clean_readings_all_adjacent_feasible_kept():
+    """相邻读数全部物理可行：全部保留，删除数为 0。"""
+    body = _clean(_clean_payload([0, 100, 200])).json()
+    assert body["status"] == "ok"
+    assert body["modulus"] == 1000
+    assert body["reading_count"] == 3
+    assert body["kept_indices"] == [0, 1, 2]
+    assert body["removed_indices"] == []
+    assert body["removed_count"] == 0
+    assert body["detail"] is None
+
+
+def test_clean_readings_drops_abnormal_spike():
+    """中间读数突增超速且与两侧都不可行：删该条后首末直连可行。"""
+    # 0 -> 900（10s 上限 100）不可行；900 -> 150（回绕后 250）不可行；
+    # 0 -> 150（20s 上限 200）可行
+    body = _clean(_clean_payload([0, 900, 150])).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 2]
+    assert body["removed_indices"] == [1]
+    assert body["removed_count"] == 1
+
+
+def test_clean_readings_wrap_around_pair():
+    """跨回绕读数对 900 -> 100，20/s × 10s = 200：增量 200 恰好可行。"""
+    body = _clean(_clean_payload([900, 100], rate=20)).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 1]
+    assert body["removed_indices"] == []
+    assert body["removed_count"] == 0
+
+
+def test_clean_readings_two_readings_infeasible_no_solution():
+    """只有两条读数且直连不可行：首尾无法连通，无解。"""
+    body = _clean(_clean_payload([0, 500])).json()
+    assert body["status"] == "no_solution"
+    assert body["reading_count"] == 2
+    assert body["kept_indices"] == []
+    assert body["removed_indices"] == []
+    assert body["removed_count"] is None
+    assert "无解" in body["detail"]
+
+
+def test_clean_readings_no_solution_unreachable_end():
+    """首读数无法经任何读数到达末读数：明确无解，不编造删除方案。"""
+    # 0 -> 500 / 0 -> 900 / 500 -> 900 均超速不可行
+    body = _clean(_clean_payload([0, 500, 900])).json()
+    assert body["status"] == "no_solution"
+    assert body["kept_indices"] == []
+    assert body["removed_indices"] == []
+    assert body["removed_count"] is None
+    assert body["detail"]
+
+
+def test_clean_readings_first_and_last_always_kept():
+    """首尾必保留：中间多条异常时宁可全删内部读数，也要保留首尾直连。"""
+    # 0 -> 100（30s 上限 300）可行；中间 999/998 与 0 直连均超速，
+    # 与末读 100 配对也仅 1->3 可行（但 1 从 0 不可达）
+    body = _clean(_clean_payload([0, 999, 998, 100])).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 3]
+    assert body["removed_indices"] == [1, 2]
+    assert body["removed_count"] == 2
+
+
+def test_clean_readings_lexicographic_tie_break():
+    """两组最优解 [0,1,3] 与 [0,2,3]（均删 1 条）：按保留索引序列选 [0,1,3]。"""
+    # 0->1(+100) 可行；1->2(回绕 950) 不可行；2->3(+100) 可行；
+    # 0->2(+50, 20s) 可行；1->3(+50, 20s) 可行；0->3(+150, 30s) 仅删 2 条
+    body = _clean(_clean_payload([0, 100, 50, 150])).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 1, 3]
+    assert body["removed_indices"] == [2]
+    assert body["removed_count"] == 1
+
+
+def test_clean_readings_lexicographic_prefers_earlier_small_indices():
+    """更长的平局：第 1 位可提前保留小索引时优先，逐位字典序最小。"""
+    # 构造：0 可直达 1、2、3；1 可到 3；2 可到 3；末读 4；
+    # 0->4、3->4 可行，1/2 -> 4 不可行；1->2 不可行
+    values = [0, 50, 20, 100, 150]
+    offsets = [0, 10, 20, 40, 50]  # rate=10 => 容量 100/200/400/500
+    # 0->1: +50 可行；0->2: +20 可行；0->3: +100<=400 可行；0->4: +150<=500 可行
+    # 1->2: -30 回绕 970 > 100 不可行；1->3: +50<=300 可行；1->4: +100<=400 可行
+    # 2->3: +80<=200 可行；2->4: +130<=300 可行；3->4: +50<=100 可行
+    # 最长路径 0->1->3->4 与 0->2->3->4 均为 3 边（删 1 条），选前者
+    body = _clean(_clean_payload(values, offsets)).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 1, 3, 4]
+    assert body["removed_indices"] == [2]
+
+
+def test_clean_readings_zero_rate_flat_only():
+    """速率为 0：只有读数不变的对可行（用量 0），平读数全保留。"""
+    body = _clean(_clean_payload([7, 7, 7], rate=0)).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 1, 2]
+    assert body["removed_count"] == 0
+
+
+def test_clean_readings_modulus_one():
+    """模数为 1 时读数恒为 0，任意对 diff=0 均可行：全部保留。"""
+    body = _clean(_clean_payload([0, 0, 0, 0], modulus=1, rate=0)).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 1, 2, 3]
+    assert body["removed_count"] == 0
+
+
+def test_clean_readings_fractional_rate_exact():
+    """小数速率按精确分数判定：0.5/s × 10s = 5，增量 5 可行、增量 6 不可行。"""
+    ok = _clean(_clean_payload([0, 5], rate=0.5)).json()
+    assert ok["status"] == "ok" and ok["kept_indices"] == [0, 1]
+    bad = _clean(_clean_payload([0, 6], rate=0.5)).json()
+    assert bad["status"] == "no_solution"
+
+
+def test_clean_readings_timezone_offset_normalized():
+    """带非 UTC 时区的时间戳换算 UTC 后按同一时间差判定。"""
+    payload = _clean_payload([0, 100])
+    payload["readings"][0]["timestamp"] = "2026-09-24T08:00:00+08:00"
+    payload["readings"][1]["timestamp"] = "2026-09-24T08:00:10+08:00"
+    body = _clean(payload).json()
+    assert body["status"] == "ok"
+    assert body["kept_indices"] == [0, 1]
+
+
+def test_clean_readings_reuses_validation():
+    """复用读数/模数/速率校验：非法输入一律 422。"""
+    base = _clean_payload([0, 100, 200])
+    # 读数越界
+    bad = copy.deepcopy(base)
+    bad["readings"][1]["value"] = 1000
+    assert _clean(bad).status_code == 422
+    # 时间戳不递增
+    bad = copy.deepcopy(base)
+    bad["readings"][1]["timestamp"] = bad["readings"][0]["timestamp"]
+    assert _clean(bad).status_code == 422
+    # 时间戳逆序
+    bad = copy.deepcopy(base)
+    bad["readings"][2]["timestamp"] = bad["readings"][0]["timestamp"]
+    assert _clean(bad).status_code == 422
+    # 缺时区
+    bad = copy.deepcopy(base)
+    bad["readings"][0]["timestamp"] = "2026-09-24T00:00:00"
+    assert _clean(bad).status_code == 422
+    # 亚秒
+    bad = copy.deepcopy(base)
+    bad["readings"][0]["timestamp"] = "2026-09-24T00:00:00.5Z"
+    assert _clean(bad).status_code == 422
+    # 负速率
+    assert _clean({**base, "max_rate_per_second": -1}).status_code == 422
+    # 模数 < 1
+    assert _clean({**base, "modulus": 0}).status_code == 422
+    # 读数不足 2 条
+    bad = copy.deepcopy(base)
+    bad["readings"] = bad["readings"][:1]
+    assert _clean(bad).status_code == 422
+    # 缺字段
+    assert _clean({"modulus": 1000, "readings": base["readings"]}).status_code == 422
+
+
+def test_clean_readings_core_result_fields():
+    """核心函数返回不可变结果，含保留/删除元组。"""
+    base = datetime(2026, 9, 24, tzinfo=timezone.utc)
+    ts = [base + timedelta(seconds=10 * i) for i in range(3)]
+    result = clean_readings([0, 900, 150], ts, 1000, Fraction(10))
+    assert result.status == "ok"
+    assert result.kept_indices == (0, 2)
+    assert result.removed_indices == (1,)
+
+
+def test_clean_readings_exact_by_brute_force():
+    """随机小参数下，与枚举全部含首尾子序列（最长 + 字典序最小）结果一致。"""
+    rng = random.Random(20260926)
+    checked = 0
+    for _ in range(1500):
+        n = rng.randint(2, 8)
+        modulus = rng.choice([1, 2, 3, 5, 10, 100, 1000])
+        # 整数或半整数速率，JSON 数字可精确表示（二进制友好）
+        rate = Fraction(rng.randint(0, 40), 2)
+        values = [rng.randrange(modulus) for _ in range(n)]
+        offsets = []
+        t = 0
+        for _ in range(n):
+            offsets.append(t)
+            t += rng.randint(1, 15)
+
+        # 暴力：枚举所有含首尾的子序列，相邻对用 solve_segment 独立判定
+        def pair_ok(i, j):
+            sol = solve_segment(
+                0,
+                values[i],
+                values[j],
+                offsets[j] - offsets[i],
+                modulus,
+                rate,
+            )
+            return sol.status != "no_solution"
+
+        best = None
+        for mask in range(1 << (n - 2)):
+            seq = (0,) + tuple(
+                i for i in range(1, n - 1) if (mask >> (i - 1)) & 1
+            ) + (n - 1,)
+            if all(pair_ok(a, b) for a, b in zip(seq, seq[1:])):
+                if (
+                    best is None
+                    or len(seq) > len(best)
+                    or (len(seq) == len(best) and seq < best)
+                ):
+                    best = seq
+
+        body = _clean(
+            _clean_payload(values, offsets, modulus, float(rate))
+        ).json()
+        assert body["reading_count"] == n
+        if best is None:
+            assert body["status"] == "no_solution"
+            assert body["kept_indices"] == []
+            assert body["removed_indices"] == []
+            assert body["removed_count"] is None
+            assert body["detail"]
+        else:
+            assert body["status"] == "ok"
+            assert tuple(body["kept_indices"]) == best
+            expect_removed = tuple(i for i in range(1, n - 1) if i not in set(best))
+            assert tuple(body["removed_indices"]) == expect_removed
+            assert body["removed_count"] == len(expect_removed)
+            assert body["detail"] is None
+            # 保留序列必含首尾且严格升序
+            assert body["kept_indices"][0] == 0
+            assert body["kept_indices"][-1] == n - 1
+            assert body["kept_indices"] == sorted(body["kept_indices"])
+            # 删除数 + 保留数 == 读数总数
+            assert body["removed_count"] + len(body["kept_indices"]) == n
+        checked += 1
+    assert checked > 1000
