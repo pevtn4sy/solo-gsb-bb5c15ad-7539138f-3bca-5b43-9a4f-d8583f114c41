@@ -23,6 +23,7 @@ from app.core import (
     STATUS_NO_SOLUTION,
     STATUS_OK,
     charge_amount_extremes,
+    clean_readings,
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
@@ -37,7 +38,7 @@ from app.core import (
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -63,7 +64,12 @@ app = FastAPI(
         "合并重叠或相接时段，各相邻读数段扣除停水后把剩余连续供水片段"
         "分别 floor(速率×秒数) 取整求和作为段容量（不跨停水合并取整），"
         "再以账单总用量联立收紧各段可行圈数，区分单段无解、账单同余"
-        "冲突与总量超界。"
+        "冲突与总量超界；"
+        "另支持异常采样清理：把任意两条可相邻保留的读数按时间差、非负"
+        "增量与回绕模数判定物理可行性，在首尾读数必须保留的前提下求"
+        "删除最少内部读数的保留序列（多组最优解按保留索引序列字典序"
+        "最小选定），返回保留索引、删除索引与删除数，首尾无法连通时"
+        "返回明确无解状态。"
     ),
 )
 
@@ -2191,4 +2197,83 @@ def compare_dual_meter_usage(req: DualMeterCompareRequest) -> DualMeterCompareRe
         unique=result.unique,
         meters=meters,
         conflicts=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 异常采样清理
+# ---------------------------------------------------------------------------
+
+
+class CleanReadingsRequest(_BaseUsageRequest):
+    """异常采样清理请求：模数、按时序排列的读数序列与非负每秒速率上限。
+
+    读数、时间戳、模数与速率校验与 `/v1/usage/verify` 完全一致（复用同一
+    校验），无额外字段。
+    """
+
+
+class CleanReadingsResponse(BaseModel):
+    status: Literal["ok", "no_solution"]
+    modulus: int
+    kept_indices: Optional[List[int]] = Field(
+        default=None,
+        description="保留的读数索引（含首尾，升序）：删除最少内部读数的最优"
+        "序列，多组最优解按索引序列字典序最小选定；无解时为 null",
+    )
+    deleted_indices: Optional[List[int]] = Field(
+        default=None,
+        description="被删除的内部读数索引（升序，不含首尾）；无解时为 null",
+    )
+    deleted_count: Optional[int] = Field(
+        default=None,
+        description="删除的内部读数条数（即 deleted_indices 长度）；无解时为 null",
+    )
+    detail: Optional[str] = Field(
+        default=None,
+        description="首尾无法连通时的无解原因说明；有解时为 null",
+    )
+
+
+@app.post("/v1/usage/clean-readings", response_model=CleanReadingsResponse)
+def clean_usage_readings(req: CleanReadingsRequest) -> CleanReadingsResponse:
+    """异常采样清理：删除最少内部读数，使保留序列的每对相邻读数物理可行。
+
+    复用现有秒级时间戳、读数范围、模数与速率上限校验（与
+    `/v1/usage/verify` 完全一致）。任意两条读数可相邻保留当且仅当按
+    时间差、非负增量与回绕模数判定物理可行（存在非负整数圈数使增量
+    非负且不超速，复用逐段复核的精确速率运算）。首尾读数必须保留；
+    在「可行对」有向无环图上求首到末的最长保留序列（即删除最少内部
+    读数），多组最优解按保留索引序列字典序最小选定。首尾无法连通时
+    返回明确的 `no_solution` 状态，不虚构清理方案。
+    """
+    values = [r.value for r in req.readings]
+    timestamps = [r.timestamp for r in req.readings]
+    result = clean_readings(
+        values, timestamps, req.modulus, Fraction(req.max_rate_per_second)
+    )
+    if not result.feasible:
+        return CleanReadingsResponse(
+            status=STATUS_NO_SOLUTION,
+            modulus=req.modulus,
+            kept_indices=None,
+            deleted_indices=None,
+            deleted_count=None,
+            detail=(
+                f"无解：首读数（索引 0）与末读数（索引 {len(values) - 1}）"
+                "之间不存在物理可行的保留序列——无论删除哪些内部读数，"
+                "都无法使每对相邻保留读数同时满足非负增量与每秒速率上限"
+                f"约束（模数 {req.modulus}），首尾无法连通"
+            ),
+        )
+    kept = list(result.kept_indices)
+    kept_set = set(kept)
+    deleted = [i for i in range(1, len(values) - 1) if i not in kept_set]
+    return CleanReadingsResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        kept_indices=kept,
+        deleted_indices=deleted,
+        deleted_count=len(deleted),
+        detail=None,
     )

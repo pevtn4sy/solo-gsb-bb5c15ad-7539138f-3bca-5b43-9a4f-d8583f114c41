@@ -114,6 +114,18 @@
         k_max = floor((C - diff) / M)
     k_max < k_min 即单段无解。各段均可行后，账单总用量联立直接复用
     reconcile_total 的整数区间收紧（同余冲突 / 总量超界原因也一致）。
+
+异常采样清理（clean_readings）：
+    任意两条读数 i < j 可相邻保留（物理可行）当且仅当存在非负整数
+    圈数 k 使 0 <= (r_j - r_i) + k*M <= 速率 × (t_j - t_i)——与逐段
+    复核同一判定（复用 solve_segment 的精确速率运算）。可行对构成
+    有向无环图（边只指向更晚时刻），首尾读数必须保留，问题等价于求
+    0 -> n-1 的最长路径（保留最多即删除最少内部读数）。逐端点动态
+    规划：dp[j] 为以 j 结尾的最优保留序列，先比保留条数（多者优），
+    再按索引序列字典序取最小；候选均为 dp[i] + [j]，公共后缀不影响
+    字典序比较，故逐端点只保留唯一最优即得全局最优（多组最优解按
+    保留索引序列字典序最小选定）。O(n^2) 对可行性判定，不枚举子
+    序列；首末不可连通时明确返回不可行，不虚构清理方案。
 """
 
 from __future__ import annotations
@@ -1390,3 +1402,85 @@ def compare_dual_meter(
         intersect_min=intersect_min,
         intersect_max=intersect_max,
     )
+
+
+# ---------------------------------------------------------------------------
+# 异常采样清理（clean-readings）：删除最少内部读数使保留序列物理可行
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CleanReadingsResult:
+    """异常采样清理结果。"""
+
+    feasible: bool  # 首末读数是否可由物理可行的保留序列连通
+    kept_indices: Tuple[int, ...]  # 保留索引（含首尾，升序）；不可行时为空
+
+
+def clean_readings(
+    values: Sequence[int],
+    timestamps: Sequence[datetime],
+    modulus: int,
+    max_rate_per_second: Fraction,
+) -> CleanReadingsResult:
+    """删除最少内部读数，使保留序列的每对相邻读数物理可行。
+
+    任意两条读数 ``i < j`` 可相邻保留（物理可行）当且仅当存在非负整数
+    圈数 ``k`` 使增量 ``(values[j] - values[i]) + k*modulus`` 非负且不
+    超过 ``max_rate_per_second × (t_j - t_i)``——与逐段复核同一判定
+    （复用 :func:`solve_segment` 的精确速率运算）。可行对构成有向无环
+    图（边只指向更晚时刻），首尾读数必须保留，问题等价于求
+    ``0 -> n-1`` 的最长路径（保留最多即删除最少内部读数）。
+
+    逐端点动态规划：``dp[j]`` 为以 ``j`` 结尾的最优保留序列，先比保留
+    条数（多者优），再按索引序列字典序取最小。所有候选均为
+    ``dp[i] + [j]``，公共后缀不影响字典序比较，故逐端点只保留唯一最优
+    即可得到全局最优（多组最优解按保留索引序列字典序最小选定）。
+    ``O(n²)`` 对可行性判定，不枚举子序列。首末不可连通时返回不可行，
+    不虚构清理方案。
+
+    :param values: 各读数值（满足 0 <= value < modulus，由调用方校验）
+    :param timestamps: 与各读数一一对应的严格递增秒精度时间戳
+    :param modulus: 计数器模数（回绕周期）
+    :param max_rate_per_second: 每秒最大计数增量（非负，精确分数）
+    """
+    n = len(values)
+    if n != len(timestamps):
+        raise ValueError("values 与 timestamps 数量必须一致")
+    if n < 2:
+        raise ValueError("至少需要 2 条读数")
+
+    epoch = [int((t - timestamps[0]).total_seconds()) for t in timestamps]
+
+    # dp[j] = (保留条数, 保留索引序列)：以 j 结尾的最优序列；不可达为 None
+    dp: list = [None] * n
+    dp[0] = (1, (0,))
+    for j in range(1, n):
+        best = None
+        for i in range(j):
+            prev = dp[i]
+            if prev is None:
+                continue
+            sol = solve_segment(
+                i,
+                values[i],
+                values[j],
+                epoch[j] - epoch[i],
+                modulus,
+                max_rate_per_second,
+            )
+            if sol.max_wraps < sol.min_wraps:
+                continue  # 物理不可行：i 与 j 不能相邻保留
+            cand = (prev[0] + 1, prev[1] + (j,))
+            if (
+                best is None
+                or cand[0] > best[0]
+                or (cand[0] == best[0] and cand[1] < best[1])
+            ):
+                best = cand
+        dp[j] = best
+
+    final = dp[n - 1]
+    if final is None:
+        return CleanReadingsResult(feasible=False, kept_indices=())
+    return CleanReadingsResult(feasible=True, kept_indices=final[1])
